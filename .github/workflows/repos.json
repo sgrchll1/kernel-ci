@@ -19,7 +19,7 @@
   "AnyKernel3": {
     "use": true,
     "release": true,
-    "repo": "https://github.com/console-ramoops/AnyKernel3",
-    "branch": "master"
+    "repo": "https://github.com/rayola708/AnyKernel3",
+    "branch": "tissot"
   }
 }
