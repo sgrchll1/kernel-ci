@@ -1,0 +1,457 @@
+name: Build Kernel-tissot-Non(KSU-Nomount)
+
+env:
+  OUT_DIR: "${{ github.workspace }}/out"
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_name:
+        description: "Kernel name (e.g. kernel_xiaomi_santoni)"
+        required: true
+      kernel_repo:
+        description: "Kernel source repo URL"
+        required: true
+      kernel_branch:
+        description: "Kernel branch"
+        required: true
+      device:
+        description: "Device codename (e.g. santoni)"
+        required: true
+      defconfig:
+        description: "Defconfig name (e.g. santoni_defconfig)"
+        required: true
+      withKernelSU:
+        description: "KernelSU option"
+        required: true
+        type: choice
+        default: "patch_download"
+        options:
+          - "none"
+          - "download"
+          - "patch_download"
+      kernelsu_repo:
+        description: "KernelSU repository URL"
+        required: true
+        default: "https://github.com/KernelSU-Next/KernelSU-Next"
+       kernelsu_branch:
+        description: "KernelSU branch or tag"
+        required: true
+        default: "legacy"
+
+      withNpMount:
+        description: "Nomount option"
+        required: true
+        type: choice
+        default: "patch_download"
+        options:
+          - "none"
+          - "download"
+          - "patch_download"
+      kernelsu_repo:
+        description: "KernelSU repository URL"
+        required: true
+        default: "github.com/maxsteeel/nomount"
+      kernelsu_branch:
+        description: "Nomount branch or tag"
+        required: true
+        default: "legacy"
+
+jobs:
+  build-kernel:
+    name: "⚡ Build kernel"
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      WORKSPACE: ${{ github.workspace }}
+      KBUILD_BUILD_USER: "builder"
+      KBUILD_BUILD_HOST: "android"
+      KERNEL_NAME: ${{ inputs.kernel_name }}
+      KERNEL_REPO: ${{ inputs.kernel_repo }}
+      KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+      KERNEL_DEVICE: ${{ inputs.device }}
+      DEFCONFIG_NAME: ${{ inputs.defconfig }}
+      TG_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      # Helper Telegram: dipakai oleh step notifikasi di bawah.
+      # Semua kegagalan dicetak jelas di log (tidak lagi skip diam-diam).
+      - name: "✈ telegram helper"
+        run: |
+          cat > "$RUNNER_TEMP/tg.sh" <<'EOF'
+          tg_check() {
+            if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+              echo "::error::Secret TG_BOT_TOKEN / TG_CHAT_ID kosong. Buat sebagai *Repository secret* (Settings > Secrets and variables > Actions > Secrets) dengan nama persis sama."
+              return 1
+            fi
+          }
+
+          # tg_msg "<teks html>"
+          tg_msg() {
+            local resp
+            resp=$(curl -sS --max-time 60 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --form-string chat_id="$TG_CHAT_ID" \
+              --form-string parse_mode="HTML" \
+              --form-string disable_web_page_preview="true" \
+              --form-string text="$1") || { echo "::error::curl gagal menghubungi Telegram"; return 1; }
+            if echo "$resp" | grep -q '"ok":true'; then
+              echo "✔ Pesan Telegram terkirim"
+            else
+              echo "$resp"
+              echo "::error::Telegram menolak pesan (lihat respons di atas)"
+              return 1
+            fi
+          }
+
+          # tg_doc "<path file>" "<caption html>"
+          tg_doc() {
+            local resp
+            resp=$(curl -sS --max-time 600 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" \
+              --form-string chat_id="$TG_CHAT_ID" \
+              --form-string parse_mode="HTML" \
+              --form-string caption="$2" \
+              -F document=@"$1") || { echo "::error::curl gagal mengirim file ke Telegram"; return 1; }
+            if echo "$resp" | grep -q '"ok":true'; then
+              echo "✔ File terkirim ke Telegram"
+            else
+              echo "$resp"
+              echo "::error::Telegram menolak file (lihat respons di atas)"
+              return 1
+            fi
+          }
+          EOF
+
+      - name: "⟡ checkout"
+        uses: actions/checkout@v4
+
+      - name: "⟡ load config"
+        id: config
+        run: |
+          CONFIG=".github/workflows/repos.json"
+          echo "builddate=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+          
+          # Map legacy boolean strings or new choice values
+          val="${{ inputs.withKernelSU }}"
+          if [ "$val" = "true" ]; then
+            val="patch_download"
+          elif [ "$val" = "false" ]; then
+            val="none"
+          fi
+          echo "withKernelSU=$val" >> $GITHUB_OUTPUT
+          
+          echo "useAnykernel=$(jq -r '.AnyKernel3.use' $CONFIG)" >> $GITHUB_OUTPUT
+          echo "release=$(jq -r '.AnyKernel3.release' $CONFIG)" >> $GITHUB_OUTPUT
+
+      # Sekaligus tes kirim: kalau secret/chat id salah, workflow berhenti di sini
+      # (tidak perlu menunggu build 30+ menit baru ketahuan).
+      - name: "✈ telegram: Kernel CI Build started (tes kirim)"
+        run: |
+          source "$RUNNER_TEMP/tg.sh"
+          tg_check || exit 1
+
+          tg_msg "<b>🚀 Kernel CI Build dimulai</b>
+          <b>Kernel:</b> <code>${KERNEL_NAME}</code>
+          <b>Device:</b> <code>${KERNEL_DEVICE}</code>
+          <b>Repo:</b> <code>${KERNEL_REPO}</code>
+          <b>Branch:</b> <code>${KERNEL_BRANCH}</code>
+          <b>Defconfig:</b> <code>${DEFCONFIG_NAME}</code>
+          <b>KernelSU:</b> <code>${{ steps.config.outputs.withKernelSU }}</code>
+          <b>NoMount:</b> <code>${{ inputs.withNoMount }}</code>
+          <a href=\"${RUN_URL}\">Lihat run</a>" || exit 1
+
+      - name: "✦ install deps"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc libssl-dev libfl-dev bison flex libarchive-tools zip libelf-dev zlib1g-dev
+
+      - name: "✦ clone anykernel3"
+        run: |
+          CONFIG=".github/workflows/repos.json"
+          ANYKERNEL_REPO=$(jq -r '.AnyKernel3.repo' $CONFIG)
+          ANYKERNEL_BRANCH=$(jq -r '.AnyKernel3.branch' $CONFIG)
+          git clone --recursive --depth=1 -j $(nproc) --branch $ANYKERNEL_BRANCH $ANYKERNEL_REPO AnyKernel3
+
+      - name: "✦ clone kernel source"
+        run: |
+          git clone --recursive --depth=1 -j $(nproc) --branch $KERNEL_BRANCH $KERNEL_REPO $KERNEL_NAME
+
+      - name: "✦ fetch toolchains"
+        run: |
+          CONFIG=".github/workflows/repos.json"
+          toolchains=$(jq -c '.toolchains' $CONFIG)
+          toolchains_num="$(echo $toolchains | jq 'length')"
+          for ((i=0;i<toolchains_num;i++)); do
+            toolchain_name=$(echo $toolchains | jq -r ".[$i].name")
+            toolchain_repo=$(echo $toolchains | jq -r ".[$i].repo")
+            toolchain_branch=$(echo $toolchains | jq -r ".[$i].branch")
+
+            git clone --recursive --depth=1 -j $(nproc) --branch $toolchain_branch $toolchain_repo $toolchain_name
+
+            jq -r ".[$i].binPath[] | tostring" <<< "$toolchains" | while read -r bin_path; do
+              echo "$WORKSPACE/$toolchain_name/$bin_path" >> $GITHUB_PATH
+            done
+          done
+
+      - name: "⚙ configure build"
+        id: generate-args
+        run: |
+          CONFIG=".github/workflows/repos.json"
+          params=$(jq -c '.params' $CONFIG)
+          THREAD=$(nproc --all)
+
+          ARCH=$(echo $params | jq -r ".ARCH")
+          CC=$(echo $params | jq -r ".CC")
+
+          args="-j$THREAD"
+
+          if [ -n "${{ env.OUT_DIR }}" ]; then
+            mkdir -p ${{ env.OUT_DIR }} && args="$args O=${{ env.OUT_DIR }}"
+          fi
+          if [ -n "$ARCH" ]; then
+            args="$args ARCH=$ARCH"
+          fi
+          if [ -n "$CC" ]; then
+            args="$args CC=${{ env.WORKSPACE }}/$CC"
+          fi
+          while read -r externalCommand; do
+            args="$args $externalCommand"
+          done < <(jq -r '.externalCommand | to_entries[] | "\(.key)=${{ env.WORKSPACE }}/\(.value)"' <<< "$params")
+
+          echo "ARCH=$ARCH" >> $GITHUB_OUTPUT
+          echo "args=$args" >> $GITHUB_OUTPUT
+          
+      - name: "⚡ remove hardcoded build user/host"
+        working-directory: ${{ env.KERNEL_NAME }}
+        run: |
+          echo "== Sebelum =="
+          grep -rnE "KBUILD_BUILD_(USER|HOST)|LINUX_COMPILE_(BY|HOST)=" \
+            Makefile arch/*/Makefile scripts/mkcompile_h 2>/dev/null || true
+
+          # 1. Hapus override KBUILD_BUILD_USER/HOST di Makefile utama & arch
+          for f in Makefile arch/*/Makefile; do
+            [ -f "$f" ] || continue
+            sed -i -E '/^[[:space:]]*(override[[:space:]]+)?(export[[:space:]]+)?KBUILD_BUILD_(USER|HOST)[[:space:]]*[:?+]?=/d' "$f"
+          done
+
+          # 2. Ganti nilai literal di scripts/mkcompile_h dengan env var
+          #    (baris bawaan yang memakai $ atau ( tidak tersentuh)
+          f=scripts/mkcompile_h
+          if [ -f "$f" ]; then
+            sed -i -E 's|^([[:space:]]*)LINUX_COMPILE_BY=[^$(`]+$|\1LINUX_COMPILE_BY="$KBUILD_BUILD_USER"|' "$f"
+            sed -i -E 's|^([[:space:]]*)LINUX_COMPILE_HOST=[^$(`]+$|\1LINUX_COMPILE_HOST="$KBUILD_BUILD_HOST"|' "$f"
+          fi
+
+          echo "== Sesudah =="
+          grep -rnE "KBUILD_BUILD_(USER|HOST)|LINUX_COMPILE_(BY|HOST)=" \
+            Makefile arch/*/Makefile scripts/mkcompile_h 2>/dev/null || true
+
+      - name: "⚡ patch KernelSU"
+        working-directory: ${{ env.KERNEL_NAME }}
+        if: ${{ steps.config.outputs.withKernelSU != 'none' }}
+        run: |
+          arch=${{ steps.generate-args.outputs.ARCH }}
+          mode="${{ steps.config.outputs.withKernelSU }}"
+
+          if [ "$mode" = "download" ] || [ "$mode" = "patch_download" ]; then
+            if [ -d "./KernelSU" ]; then
+              rm -rf "./KernelSU"
+            fi
+            if [ -d "./drivers/kernelsu" ]; then
+              rm -rf "./drivers/kernelsu"
+            fi
+            if [ -d "./common/drivers/kernelsu" ]; then
+              rm -rf "./common/drivers/kernelsu"
+            fi
+
+            # Clone the custom KernelSU repository and branch
+            git clone --branch "${{ inputs.kernelsu_branch }}" "${{ inputs.kernelsu_repo }}" KernelSU
+
+            # Fix MODULE_IMPORT_NS compatibility for kernel < 5.4 (e.g. 4.19)
+            if [ -f "KernelSU/kernel/core/init.c" ]; then
+              sed -i '1i #ifndef MODULE_IMPORT_NS\n#define MODULE_IMPORT_NS(ns)\n#endif' KernelSU/kernel/core/init.c
+            fi
+
+            # Determine drivers directory
+            if [ -d "common/drivers" ]; then
+              driver_dir="common/drivers"
+            else
+              driver_dir="drivers"
+            fi
+
+            # Symlink
+            ln -sf "$(realpath --relative-to="$driver_dir" "./KernelSU/kernel")" "$driver_dir/kernelsu"
+
+            # Modify Makefile/Kconfig if not already patched
+            grep -q "kernelsu" "$driver_dir/Makefile" || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> "$driver_dir/Makefile"
+            grep -q "source \"drivers/kernelsu/Kconfig\"" "$driver_dir/Kconfig" || sed -i "/endmenu/i\source \"drivers/kernelsu/Kconfig\"" "$driver_dir/Kconfig"
+
+            # Ensure CONFIG_KSU=y is added to defconfig
+            grep -q "CONFIG_KSU=y" "arch/$arch/configs/${{ env.DEFCONFIG_NAME }}" || echo "CONFIG_KSU=y" >> "arch/$arch/configs/${{ env.DEFCONFIG_NAME }}"
+          fi
+
+          if [ "$mode" = "patch_download" ]; then
+            grep -q "CONFIG_KPROBES=y" "arch/$arch/configs/${{ env.DEFCONFIG_NAME }}" || echo "CONFIG_KPROBES=y" >> "arch/$arch/configs/${{ env.DEFCONFIG_NAME }}"
+            grep -q "CONFIG_HAVE_KPROBES=y" "arch/$arch/configs/${{ env.DEFCONFIG_NAME }}" || echo "CONFIG_HAVE_KPROBES=y" >> "arch/$arch/configs/${{ env.DEFCONFIG_NAME }}"
+            grep -q "CONFIG_KPROBE_EVENTS=y" "arch/$arch/configs/${{ env.DEFCONFIG_NAME }}" || echo "CONFIG_KPROBE_EVENTS=y" >> "arch/$arch/configs/${{ env.DEFCONFIG_NAME }}"
+
+            git clone https://github.com/devnoname120/kernelsu-coccinelle || true
+            if [ -d "./kernelsu-coccinelle" ]; then
+              ./kernelsu-coccinelle/scope-minimized-hooks/apply.sh . || true
+              rm -rf ./kernelsu-coccinelle/
+            fi
+          fi
+          
+      - name: "⚡ integrate NoMount"
+        if: ${{ inputs.withNoMount == 'true' }}
+        working-directory: ${{ env.KERNEL_NAME }}
+        run: |
+          arch=${{ steps.generate-args.outputs.ARCH }}
+          defconfig="arch/$arch/configs/${{ env.DEFCONFIG_NAME }}"
+          branch="${NOMOUNT_BRANCH:-dev}"
+
+          # setup.sh resmi: menyalin fs/nomount/ + mem-patch fs/Makefile, Kconfig, dll.
+          curl -fsSL "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/${branch}/kernel/setup.sh" -o "$RUNNER_TEMP/nomount_setup.sh" \
+            || { echo "::error::Gagal mengunduh setup.sh NoMount (branch: ${branch})"; exit 1; }
+          bash "$RUNNER_TEMP/nomount_setup.sh" "$branch" \
+            || { echo "::error::setup.sh NoMount gagal diterapkan ke source kernel"; exit 1; }
+
+          # Built-in (=y)
+          grep -q "^CONFIG_NOMOUNT=y" "$defconfig" || echo "CONFIG_NOMOUNT=y" >> "$defconfig"
+
+          echo "== NoMount terintegrasi =="
+          ls -la fs/nomount/ || true
+          grep -n "nomount" fs/Makefile fs/Kconfig || true
+
+      - name: "⚙ make defconfig"
+        working-directory: ${{ env.KERNEL_NAME }}
+        run: |
+          make ${{ steps.generate-args.outputs.args }} ${{ env.DEFCONFIG_NAME }}
+
+      - name: "⚒ compile kernel"
+        working-directory: ${{ env.KERNEL_NAME }}
+        run: |
+          make ${{ steps.generate-args.outputs.args }}
+
+      - name: "↑ upload Image"
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-${{ env.KERNEL_DEVICE }}-${{ env.KERNEL_NAME }}-${{ steps.config.outputs.builddate }}
+          path: ${{ env.OUT_DIR }}/arch/${{ steps.generate-args.outputs.ARCH }}/boot/Image
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: "↑ upload Image.gz"
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image.gz-${{ env.KERNEL_DEVICE }}-${{ env.KERNEL_NAME }}-${{ steps.config.outputs.builddate }}
+          path: ${{ env.OUT_DIR }}/arch/${{ steps.generate-args.outputs.ARCH }}/boot/Image.gz
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: "↑ upload dtb"
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtb-${{ env.KERNEL_DEVICE }}-${{ env.KERNEL_NAME }}-${{ steps.config.outputs.builddate }}
+          path: ${{ env.OUT_DIR }}/arch/${{ steps.generate-args.outputs.ARCH }}/boot/dtb
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: "↑ upload dtbo.img"
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtbo.img-${{ env.KERNEL_DEVICE }}-${{ env.KERNEL_NAME }}-${{ steps.config.outputs.builddate }}
+          path: ${{ env.OUT_DIR }}/arch/${{ steps.generate-args.outputs.ARCH }}/boot/dtbo.img
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: "⬡ pack AnyKernel3"
+        if: ${{ steps.config.outputs.useAnykernel == 'true' }}
+        run: |
+          builddate=${{ steps.config.outputs.builddate }}
+          arch=${{ steps.generate-args.outputs.ARCH }}
+          boot="${{ env.OUT_DIR }}/arch/$arch/boot"
+          anykernel="${{ env.WORKSPACE }}/${{ env.KERNEL_DEVICE }}-${{ env.KERNEL_NAME }}_$builddate"
+
+          # Salin hasil kernel ke AnyKernel3 (urutan prioritas)
+          if [ -e "$boot/Image.gz-dtb" ]; then
+            cp -f "$boot/Image.gz-dtb" ./AnyKernel3/
+          elif [ -e "$boot/Image.gz" ]; then
+            cp -f "$boot/Image.gz" ./AnyKernel3/
+            [ -e "$boot/dtb" ] && cp -rf "$boot/dtb" ./AnyKernel3/ || true
+          elif [ -e "$boot/Image" ]; then
+            cp -f "$boot/Image" ./AnyKernel3/
+          else
+            echo "::error::Tidak ada Image / Image.gz / Image.gz-dtb di $boot"
+            ls -la "$boot" || true
+            exit 1
+          fi
+
+          cd AnyKernel3/
+          zip -q -r "$anykernel.zip" *
+          ls -lh "$anykernel.zip"
+
+      - name: "↑ upload AnyKernel3"
+        uses: actions/upload-artifact@v4
+        if: ${{ steps.config.outputs.useAnykernel == 'true' }}
+        with:
+          name: "${{ env.KERNEL_DEVICE }}-${{ env.KERNEL_NAME }}-${{ steps.config.outputs.builddate }}"
+          path: AnyKernel3/*
+
+      - name: "◈ github release"
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        if: ${{ steps.config.outputs.useAnykernel == 'true' && steps.config.outputs.release == 'true' }}
+        with:
+          tag_name: v${{ steps.config.outputs.builddate }}.${{ github.run_number }}
+          files: "${{ env.WORKSPACE }}/${{ env.KERNEL_DEVICE }}-${{ env.KERNEL_NAME }}_${{ steps.config.outputs.builddate }}.zip"
+          generate_release_notes: true
+
+      - name: "✈ telegram: kirim kernel.zip"
+        if: ${{ success() && steps.config.outputs.useAnykernel == 'true' }}
+        run: |
+          source "$RUNNER_TEMP/tg.sh"
+          tg_check || exit 1
+
+          ZIP="${WORKSPACE}/${KERNEL_DEVICE}-${KERNEL_NAME}_${{ steps.config.outputs.builddate }}.zip"
+          if [ ! -f "$ZIP" ]; then
+            echo "::error::ZIP tidak ditemukan: $ZIP"
+            exit 1
+          fi
+
+          KSU_INFO="${{ steps.config.outputs.withKernelSU }}"
+          SHA256=$(sha256sum "$ZIP" | cut -d' ' -f1)
+          SIZE=$(du -h "$ZIP" | cut -f1)
+          BYTES=$(stat -c%s "$ZIP")
+
+          CAPTION="<b>🚀 New Kernel Build Success!</b>
+          <b>🧬 Kernel Name:</b> <code>${KERNEL_NAME}</code>
+          <b>📱 Device:</b> <code>${KERNEL_DEVICE}</code>
+          <b>🌿 Branch:</b> <code>${KERNEL_BRANCH}</code>
+          <b>🔧 KernelSU:</b> <code>${KSU_INFO}</code>
+          <b>🧩 NoMount:</b> <code>${{ inputs.withNoMount }}</code>
+          <b>🗓 Tanggal:</b> <code>${{ steps.config.outputs.builddate }}</code>
+          <b>📝 Ukuran:</b> <code>${SIZE}</code>
+          <b>SHA256:</b> <code>${SHA256}</code>
+          <a href=\"${RUN_URL}\">Lihat run</a>"
+
+          # Batas upload bot Telegram = 50 MB
+          if [ "$BYTES" -gt 52428800 ]; then
+            tg_msg "${CAPTION}
+          <i>File lebih dari 50 MB, tidak bisa dikirim lewat bot. Unduh dari artifact/release pada link run di atas.</i>" || exit 1
+            exit 0
+          fi
+
+          tg_doc "$ZIP" "$CAPTION" || exit 1
+
+      - name: "✈ telegram: build gagal"
+        if: ${{ failure() }}
+        run: |
+          source "$RUNNER_TEMP/tg.sh" || exit 0
+          tg_check || exit 0
+          tg_msg "<b>❌ Kernel CI Build gagal</b>
+          <b>Kernel:</b> <code>${KERNEL_NAME}</code>
+          <b>Device:</b> <code>${KERNEL_DEVICE}</code>
+          <b>Branch:</b> <code>${KERNEL_BRANCH}</code>
+          <a href=\"${RUN_URL}\">Lihat log</a>" || true
