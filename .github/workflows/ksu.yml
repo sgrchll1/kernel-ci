@@ -34,12 +34,12 @@ on:
         description: "KernelSU repository URL"
         required: true
         default: "https://github.com/KernelSU-Next/KernelSU-Next"
-       kernelsu_branch:
+      kernelsu_branch:
         description: "KernelSU branch or tag"
         required: true
         default: "legacy"
 
-      withNpMount:
+      withNoMount:
         description: "Nomount option"
         required: true
         type: choice
@@ -48,11 +48,11 @@ on:
           - "none"
           - "download"
           - "patch_download"
-      kernelsu_repo:
-        description: "KernelSU repository URL"
+      nomount_repo:
+        description: "NoMount repository URL"
         required: true
         default: "github.com/maxsteeel/nomount"
-      kernelsu_branch:
+      nomount_branch:
         description: "Nomount branch or tag"
         required: true
         default: "legacy"
